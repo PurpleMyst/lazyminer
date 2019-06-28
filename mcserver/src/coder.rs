@@ -40,10 +40,19 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    macro_rules! roundtrip {
+        ($value:ident: $ty:ty) => {
+            assert_eq!(
+                ($value, &[] as &[u8]),
+                <$ty>::deserialize($value.serialize().unwrap()).unwrap()
+            );
+        };
+    }
+
     proptest! {
         #[test]
-        fn test_bool(b: bool) {
-            assert_eq!((b, &[] as &[u8]), bool::deserialize(b.serialize().unwrap()).unwrap());
+        fn test_bool(value: bool) {
+            roundtrip!(value: bool);
         }
     }
 }
