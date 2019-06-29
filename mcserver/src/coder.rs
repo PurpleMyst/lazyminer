@@ -60,6 +60,31 @@ macro_rules! coder_int_impl {
 
 coder_int_impl!(i8, u8, i16, u16, i32, i64);
 
+macro_rules! coder_float_impl {
+    ($($ty:ty => $bit_ty:ty),*) => {
+        $(
+
+        // we need the types for floats but they aren't needed in the spec.
+        coder_int_impl!($bit_ty);
+
+        impl Serialize for $ty {
+            fn serialize(&self) -> Result<Cow<[u8]>> {
+                // I have no idea why I can't just replace this with `.to_owned()`.
+                Ok(Cow::from(self.to_bits().serialize()?.into_owned()))
+            }
+        }
+
+        impl Deserialize for $ty {
+            fn deserialize(buf: &[u8]) -> Result<WithRemaining<Self>> {
+                <$bit_ty>::deserialize(buf).map(|(v, rest)| (<$ty>::from_bits(v), rest))
+            }
+        }
+        )*
+    };
+}
+
+coder_float_impl!(f32 => u32, f64 => u64);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,4 +114,8 @@ mod tests {
         coder_roundtrip!(i8, u8, i16, u16, i32, i64);
     }
 
+    #[test]
+    fn test_floats() {
+        coder_roundtrip!(f32, f64);
+    }
 }
