@@ -1,3 +1,5 @@
+use std::{borrow::Cow, convert::TryInto};
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SerializeError(&'static str);
 
@@ -5,7 +7,7 @@ type Result<T, E = SerializeError> = std::result::Result<T, E>;
 type WithRemaining<'a, T> = (T, &'a [u8]);
 
 pub(crate) trait Serialize {
-    fn serialize(&self) -> Result<&[u8]>;
+    fn serialize(&self) -> Result<Cow<[u8]>>;
 }
 
 pub(crate) trait Deserialize: Sized {
@@ -13,12 +15,12 @@ pub(crate) trait Deserialize: Sized {
 }
 
 impl Serialize for bool {
-    fn serialize(&self) -> Result<&[u8]> {
-        if *self {
-            Ok(&[0x01])
+    fn serialize(&self) -> Result<Cow<[u8]>> {
+        Ok(Cow::from(if *self {
+            &[0x01u8] as &[u8]
         } else {
-            Ok(&[0x00])
-        }
+            &[0x00u8] as &[u8]
+        }))
     }
 }
 
@@ -35,24 +37,56 @@ impl Deserialize for bool {
     }
 }
 
+macro_rules! coder_int_impl {
+    ($($ty:ty),*) => {
+        $(
+        impl Serialize for $ty {
+            fn serialize(&self) -> Result<Cow<[u8]>> {
+                Ok(Cow::from((&self.to_be_bytes() as &[u8]).to_owned()))
+            }
+        }
+
+        impl Deserialize for $ty {
+            fn deserialize(buf: &[u8]) -> Result<WithRemaining<Self>> {
+                Ok((
+                    <$ty>::from_be_bytes(buf[0..std::mem::size_of::<$ty>()].try_into().unwrap()),
+                    &buf[std::mem::size_of::<$ty>()..],
+                ))
+            }
+        }
+        )*
+    };
+}
+
+coder_int_impl!(i8, u8, i16, u16, i32, i64);
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    macro_rules! roundtrip {
-        ($value:ident: $ty:ty) => {
-            assert_eq!(
-                ($value, &[] as &[u8]),
-                <$ty>::deserialize($value.serialize().unwrap()).unwrap()
-            );
+    macro_rules! coder_roundtrip {
+        ($($ty:ty),*) => {
+            $(
+            proptest!(|(x: $ty)| {
+                let serialized = x.serialize().unwrap();
+                prop_assert_eq!(
+                    (x, &[] as &[u8]),
+                    <$ty>::deserialize(&serialized).unwrap()
+                );
+            });
+            )*
         };
     }
 
-    proptest! {
-        #[test]
-        fn test_bool(value: bool) {
-            roundtrip!(value: bool);
-        }
+    #[test]
+    fn test_bool() {
+        coder_roundtrip!(bool);
     }
+
+    #[test]
+    fn test_ints() {
+        coder_roundtrip!(i8, u8, i16, u16, i32, i64);
+    }
+
 }
