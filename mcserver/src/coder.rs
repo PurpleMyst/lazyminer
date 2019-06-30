@@ -76,7 +76,7 @@ macro_rules! coder_float_impl {
 
         impl Deserialize for $ty {
             fn deserialize(buf: &[u8]) -> Result<WithRemaining<Self>> {
-                <$bit_ty>::deserialize(buf).map(|(v, rest)| (<$ty>::from_bits(v), rest))
+                Deserialize::deserialize(buf).map(|(v, rest)| (<$ty>::from_bits(v), rest))
             }
         }
         )*
@@ -84,6 +84,66 @@ macro_rules! coder_float_impl {
 }
 
 coder_float_impl!(f32 => u32, f64 => u64);
+
+macro_rules! coder_varint_impl {
+    ($($ty:ident: $inner_ty:ty),*) => {
+        $(
+            #[derive(Default, Eq, PartialEq, Debug, Clone, Copy)]
+            pub struct $ty(pub $inner_ty);
+
+            impl Serialize for $ty {
+                fn serialize(&self) -> Result<Cow<[u8]>> {
+                    if self.0 == 0 {
+                        return Ok(Cow::from(&[0u8] as &[_]))
+                    }
+
+                    let mut buf = Vec::new();
+
+                    for i in 0..=std::mem::size_of::<$ty>() * 8 / 7 {
+                        let rest = self.0 >> (7 * i);
+                        if rest == 0 {
+                            break;
+                        }
+
+                        let lower = (rest & 0b01_11_11_11) as u8;
+                        buf.push(lower | 0b10_00_00_00);
+                    }
+
+                    *buf.last_mut().unwrap() ^= 0b10_00_00_00;
+
+                    Ok(Cow::from(buf))
+                }
+            }
+
+            impl Deserialize for $ty {
+                fn deserialize(mut buf: &[u8]) -> Result<WithRemaining<Self>> {
+                    let mut result = <$ty>::default();
+
+                    for i in 0.. {
+                        let done = match buf.get(0).cloned() {
+                            Some(byte) => {
+                                result.0 |= (byte & 0b01_11_11_11) as $inner_ty << (7 * i);
+                                byte & 0b10_00_00_00 == 0
+                            },
+
+                            None => Err(SerializeError(concat!("Expected another byte for ", stringify!($ty),  " but didn't find one")))?,
+                        };
+
+                        buf = &buf[1..];
+
+                        if done {
+                            break;
+                        }
+                    }
+
+                    Ok((result, buf))
+                }
+            }
+        )*
+    }
+}
+
+coder_varint_impl!(VarInt: i32, VarLong: i64);
 
 #[cfg(test)]
 mod tests {
@@ -97,7 +157,20 @@ mod tests {
                 let serialized = x.serialize().unwrap();
                 prop_assert_eq!(
                     (x, &[] as &[u8]),
-                    <$ty>::deserialize(&serialized).unwrap()
+                    Deserialize::deserialize(&serialized).unwrap()
+                );
+            });
+            )*
+        };
+
+        ($($var:ident: $ty:ty => $expr:expr),*) => {
+            $(
+            proptest!(|($var: $ty)| {
+                let x = $expr;
+                let serialized = x.serialize().unwrap();
+                prop_assert_eq!(
+                    (x, &[] as &[u8]),
+                    Deserialize::deserialize(&serialized).unwrap()
                 );
             });
             )*
@@ -117,5 +190,10 @@ mod tests {
     #[test]
     fn test_floats() {
         coder_roundtrip!(f32, f64);
+    }
+
+    #[test]
+    fn test_varint() {
+        coder_roundtrip!(n: i32 => VarInt(n), n: i64 => VarLong(n));
     }
 }
