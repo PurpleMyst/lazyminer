@@ -13,6 +13,7 @@ pub(crate) enum Error {
     NotEnoughBytesForVarInt,
     IoError(std::io::Error),
     HumongousString,
+    HumongousVarInt,
     InvalidString,
 }
 
@@ -38,6 +39,8 @@ impl std::fmt::Display for Error {
                 "Tried to serialize string with a size larger than {}",
                 i32::max_value()
             ),
+
+            HumongousVarInt => write!(f, "Tried to deserialize a VarInt with too many bytes"),
 
             InvalidString => write!(f, "String contained non-utf8 chars."),
         }
@@ -176,7 +179,7 @@ macro_rules! coder_varint_impl {
 
                         let done = match buf.get(0).cloned() {
                             Some(byte) => {
-                                result.0 |= (byte & 0b01_11_11_11) as $inner_ty << (7 * i);
+                                result.0 |= ((byte & 0b01_11_11_11) as $inner_ty).checked_shl(7 * i).ok_or(Error::HumongousVarInt)?;
                                 byte & 0b10_00_00_00 == 0
                             },
 
