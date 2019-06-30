@@ -1,7 +1,10 @@
 use std::{borrow::Cow, convert::TryInto};
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct SerializeError(&'static str);
+pub(crate) enum SerializeError {
+    InvalidBooleanValue(u8),
+    NotEnoughBytesForVarInt,
+}
 
 type Result<T, E = SerializeError> = std::result::Result<T, E>;
 type WithRemaining<'a, T> = (T, &'a [u8]);
@@ -30,7 +33,7 @@ impl Deserialize for bool {
             match buf[0] {
                 0 => false,
                 1 => true,
-                _ => Err(SerializeError("invalid value for boolean"))?,
+                n => Err(SerializeError::InvalidBooleanValue(n))?,
             },
             &buf[1..],
         ))
@@ -68,7 +71,7 @@ macro_rules! coder_float_impl {
         coder_int_impl!($bit_ty);
 
         impl Serialize for $ty {
-            fn serialize(&self) -> Result<Cow<[u8]>> {
+            fn serialize(&self) -> Result<Cow<'static, [u8]>> {
                 // I have no idea why I can't just replace this with `.to_owned()`.
                 Ok(Cow::from(self.to_bits().serialize()?.into_owned()))
             }
@@ -126,7 +129,7 @@ macro_rules! coder_varint_impl {
                                 byte & 0b10_00_00_00 == 0
                             },
 
-                            None => Err(SerializeError(concat!("Expected another byte for ", stringify!($ty),  " but didn't find one")))?,
+                            None => Err(SerializeError::NotEnoughBytesForVarInt)?,
                         };
 
                         buf = &buf[1..];
