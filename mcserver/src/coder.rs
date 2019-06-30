@@ -10,7 +10,6 @@ use smallvec::SmallVec;
 #[derive(Debug)]
 pub(crate) enum Error {
     InvalidBooleanValue(u8),
-    NotEnoughBytesForVarInt,
     IoError(std::io::Error),
     HumongousString,
     HumongousVarInt,
@@ -29,8 +28,6 @@ impl std::fmt::Display for Error {
                 "Invalid value for boolean: expected 0x00 or 0x01, found {:#x}",
                 n
             ),
-
-            NotEnoughBytesForVarInt => write!(f, "Not enough bytes for VarInt"),
 
             IoError(err) => write!(f, "{}", err.to_string()),
 
@@ -89,8 +86,7 @@ macro_rules! coder_int_impl {
         $(
         impl Serialize for $ty {
             fn serialize(&self, mut w: impl Write) -> Result<()> {
-                w.write_all(&self.to_be_bytes())?;
-                Ok(())
+                w.write_all(&self.to_be_bytes()).map_err(Into::into)
             }
         }
 
@@ -123,8 +119,7 @@ macro_rules! coder_float_impl {
 
         impl Deserialize for $ty {
             fn deserialize(r: impl Read) -> Result<Self> {
-                let bits = Deserialize::deserialize(r)?;
-                Ok(<$ty>::from_bits(bits))
+                Deserialize::deserialize(r).map(<$ty>::from_bits)
             }
         }
         )*
@@ -144,9 +139,7 @@ macro_rules! coder_varint_impl {
                     const MAX_BYTE_SIZE: usize = 1 + std::mem::size_of::<$ty>() * 8 / 7;
 
                     if self.0 == 0 {
-                        w.write_all(&[0])?;
-
-                        return Ok(());
+                        return w.write_all(&[0]).map_err(Into::into);
                     }
 
                     let mut buf = SmallVec::<[u8; MAX_BYTE_SIZE]>::new();
@@ -163,9 +156,7 @@ macro_rules! coder_varint_impl {
 
                     *buf.last_mut().unwrap() ^= 0b10_00_00_00;
 
-                    w.write_all(&buf)?;
-
-                    Ok(())
+                    w.write_all(&buf).map_err(Into::into)
                 }
             }
 
@@ -177,16 +168,9 @@ macro_rules! coder_varint_impl {
                     for i in 0.. {
                         r.read_exact(&mut buf)?;
 
-                        let done = match buf.get(0).cloned() {
-                            Some(byte) => {
-                                result.0 |= ((byte & 0b01_11_11_11) as $inner_ty).checked_shl(7 * i).ok_or(Error::HumongousVarInt)?;
-                                byte & 0b10_00_00_00 == 0
-                            },
+                        result.0 |= ((buf[0] & 0b01_11_11_11) as $inner_ty).checked_shl(7 * i).ok_or(Error::HumongousVarInt)?;
 
-                            None => Err(Error::NotEnoughBytesForVarInt)?,
-                        };
-
-                        if done {
+                        if buf[0] & 0b10_00_00_00 == 0 {
                             break;
                         }
                     }
