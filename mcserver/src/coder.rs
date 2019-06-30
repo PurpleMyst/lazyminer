@@ -12,22 +12,34 @@ pub(crate) enum Error {
     InvalidBooleanValue(u8),
     NotEnoughBytesForVarInt,
     IoError(std::io::Error),
+    HumongousString,
+    InvalidString,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        use Error::*;
+
         match self {
-            Error::InvalidBooleanValue(n) => write!(
+            InvalidBooleanValue(n) => write!(
                 f,
                 "Invalid value for boolean: expected 0x00 or 0x01, found {:#x}",
                 n
             ),
 
-            Error::NotEnoughBytesForVarInt => write!(f, "Not enough bytes for VarInt"),
+            NotEnoughBytesForVarInt => write!(f, "Not enough bytes for VarInt"),
 
-            Error::IoError(err) => write!(f, "{}", err.to_string()),
+            IoError(err) => write!(f, "{}", err.to_string()),
+
+            HumongousString => write!(
+                f,
+                "Tried to serialize string with a size larger than {}",
+                i32::max_value()
+            ),
+
+            InvalidString => write!(f, "String contained non-utf8 chars."),
         }
     }
 }
@@ -185,6 +197,37 @@ macro_rules! coder_varint_impl {
 
 coder_varint_impl!(VarInt: i32, VarLong: i64);
 
+impl Serialize for String {
+    fn serialize(&self, mut w: impl Write) -> Result<()> {
+        use std::convert::TryInto;
+
+        let cs = self.chars().map(|c| c as u32).collect::<Vec<_>>();
+
+        cs.len()
+            .try_into()
+            .map(VarInt)
+            .map_err(|_| Error::HumongousString)?
+            .serialize(&mut w)?;
+
+        cs.into_iter()
+            .map(|c| c.serialize(&mut w))
+            .collect::<Result<()>>()
+    }
+}
+
+impl Deserialize for String {
+    fn deserialize(mut r: impl Read) -> Result<Self> {
+        let size = VarInt::deserialize(&mut r)?.0;
+
+        (0..size)
+            .map(|_| {
+                u32::deserialize(&mut r)
+                    .and_then(|c| std::char::from_u32(c).ok_or(Error::InvalidString))
+            })
+            .collect::<Result<_>>()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,10 +235,10 @@ mod tests {
 
     macro_rules! coder_roundtrip {
         ($($ty:ty),*) => {
-            coder_roundtrip!($(x: $ty => x),*);
+            coder_roundtrip!($(x: $ty => { x }: $ty),*);
         };
 
-        ($($var:ident: $ty:ty => $expr:expr),*) => {
+        ($($var:ident: $ty:ty => $expr:block$(: $expr_ty:ty)?),*) => {
             $(
             proptest!(|($var: $ty)| {
                 use std::io::{Cursor, Seek, SeekFrom};
@@ -205,7 +248,8 @@ mod tests {
                 x.serialize(&mut cursor).unwrap();
                 cursor.seek(SeekFrom::Start(0)).unwrap();
 
-                prop_assert_eq!(x, Deserialize::deserialize(&mut cursor).unwrap());
+                let deserialized$(: $expr_ty)? = Deserialize::deserialize(&mut cursor).unwrap();
+                assert_eq!(x, deserialized);
             });
             )*
         };
@@ -228,6 +272,11 @@ mod tests {
 
     #[test]
     fn test_varint() {
-        coder_roundtrip!(n: i32 => VarInt(n), n: i64 => VarLong(n));
+        coder_roundtrip!(n: i32 => { VarInt(n) }, n: i64 => { VarLong(n) });
+    }
+
+    #[test]
+    fn test_string() {
+        coder_roundtrip!(String);
     }
 }
