@@ -1,9 +1,15 @@
-use std::{borrow::Cow, convert::TryInto};
+#![deny(unused_must_use)]
 
-#[derive(Debug, PartialEq, Eq)]
+use std::{
+    io::{Read, Write},
+    mem::size_of,
+};
+
+#[derive(Debug)]
 pub(crate) enum Error {
     InvalidBooleanValue(u8),
     NotEnoughBytesForVarInt,
+    IoError(std::io::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -16,43 +22,48 @@ impl std::fmt::Display for Error {
             ),
 
             Error::NotEnoughBytesForVarInt => write!(f, "Not enough bytes for VarInt"),
+
+            Error::IoError(err) => write!(f, "{}", err.to_string()),
         }
     }
 }
 
 impl std::error::Error for Error {}
 
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Error::IoError(value)
+    }
+}
+
 type Result<T, E = Error> = std::result::Result<T, E>;
-type WithRemaining<'a, T> = (T, &'a [u8]);
 
 pub(crate) trait Serialize {
-    fn serialize(&self) -> Result<Cow<[u8]>>;
+    fn serialize(&self, w: impl Write) -> Result<()>;
 }
 
 pub(crate) trait Deserialize: Sized {
-    fn deserialize(buf: &[u8]) -> Result<WithRemaining<Self>>;
+    fn deserialize(r: impl Read) -> Result<Self>;
 }
 
 impl Serialize for bool {
-    fn serialize(&self) -> Result<Cow<[u8]>> {
-        Ok(Cow::from(if *self {
-            &[0x01u8] as &[u8]
-        } else {
-            &[0x00u8] as &[u8]
-        }))
+    fn serialize(&self, mut w: impl Write) -> Result<()> {
+        w.write_all(&[if *self { 0x01u8 } else { 0x00u8 }] as &[_])?;
+
+        Ok(())
     }
 }
 
 impl Deserialize for bool {
-    fn deserialize(buf: &[u8]) -> Result<WithRemaining<Self>> {
-        Ok((
-            match buf[0] {
-                0 => false,
-                1 => true,
-                n => Err(Error::InvalidBooleanValue(n))?,
-            },
-            &buf[1..],
-        ))
+    fn deserialize(mut r: impl Read) -> Result<Self> {
+        let mut buf = [0; 1];
+        r.read_exact(&mut buf)?;
+
+        Ok(match buf[0] {
+            0 => false,
+            1 => true,
+            n => Err(Error::InvalidBooleanValue(n))?,
+        })
     }
 }
 
@@ -60,17 +71,18 @@ macro_rules! coder_int_impl {
     ($($ty:ty),*) => {
         $(
         impl Serialize for $ty {
-            fn serialize(&self) -> Result<Cow<[u8]>> {
-                Ok(Cow::from((&self.to_be_bytes() as &[u8]).to_owned()))
+            fn serialize(&self, mut w: impl Write) -> Result<()> {
+                w.write_all(&self.to_be_bytes())?;
+                Ok(())
             }
         }
 
         impl Deserialize for $ty {
-            fn deserialize(buf: &[u8]) -> Result<WithRemaining<Self>> {
-                Ok((
-                    <$ty>::from_be_bytes(buf[0..std::mem::size_of::<$ty>()].try_into().unwrap()),
-                    &buf[std::mem::size_of::<$ty>()..],
-                ))
+            fn deserialize(mut r: impl Read) -> Result<Self> {
+                let mut buf = [0; size_of::<$ty>()];
+                r.read_exact(&mut buf)?;
+
+                Ok(<$ty>::from_be_bytes(buf))
             }
         }
         )*
@@ -87,15 +99,15 @@ macro_rules! coder_float_impl {
         coder_int_impl!($bit_ty);
 
         impl Serialize for $ty {
-            fn serialize(&self) -> Result<Cow<'static, [u8]>> {
-                // I have no idea why I can't just replace this with `.to_owned()`.
-                Ok(Cow::from(self.to_bits().serialize()?.into_owned()))
+            fn serialize(&self, w: impl Write) -> Result<()> {
+                self.to_bits().serialize(w)
             }
         }
 
         impl Deserialize for $ty {
-            fn deserialize(buf: &[u8]) -> Result<WithRemaining<Self>> {
-                Deserialize::deserialize(buf).map(|(v, rest)| (<$ty>::from_bits(v), rest))
+            fn deserialize(r: impl Read) -> Result<Self> {
+                let bits = Deserialize::deserialize(r)?;
+                Ok(<$ty>::from_bits(bits))
             }
         }
         )*
@@ -111,11 +123,14 @@ macro_rules! coder_varint_impl {
             pub struct $ty(pub $inner_ty);
 
             impl Serialize for $ty {
-                fn serialize(&self) -> Result<Cow<[u8]>> {
+                fn serialize(&self, mut w: impl Write) -> Result<()> {
                     if self.0 == 0 {
-                        return Ok(Cow::from(&[0u8] as &[_]))
+                        w.write_all(&[0])?;
+
+                        return Ok(());
                     }
 
+                    // TODO: Use a SmallVec or just a buffer since the size is known
                     let mut buf = Vec::new();
 
                     for i in 0..=std::mem::size_of::<$ty>() * 8 / 7 {
@@ -130,15 +145,20 @@ macro_rules! coder_varint_impl {
 
                     *buf.last_mut().unwrap() ^= 0b10_00_00_00;
 
-                    Ok(Cow::from(buf))
+                    w.write_all(&buf)?;
+
+                    Ok(())
                 }
             }
 
             impl Deserialize for $ty {
-                fn deserialize(mut buf: &[u8]) -> Result<WithRemaining<Self>> {
+                fn deserialize(mut r: impl Read) -> Result<Self> {
                     let mut result = <$ty>::default();
 
+                    let mut buf = [0; 1];
                     for i in 0.. {
+                        r.read_exact(&mut buf)?;
+
                         let done = match buf.get(0).cloned() {
                             Some(byte) => {
                                 result.0 |= (byte & 0b01_11_11_11) as $inner_ty << (7 * i);
@@ -148,14 +168,12 @@ macro_rules! coder_varint_impl {
                             None => Err(Error::NotEnoughBytesForVarInt)?,
                         };
 
-                        buf = &buf[1..];
-
                         if done {
                             break;
                         }
                     }
 
-                    Ok((result, buf))
+                    Ok(result)
                 }
             }
         )*
@@ -171,26 +189,20 @@ mod tests {
 
     macro_rules! coder_roundtrip {
         ($($ty:ty),*) => {
-            $(
-            proptest!(|(x: $ty)| {
-                let serialized = x.serialize().unwrap();
-                prop_assert_eq!(
-                    (x, &[] as &[u8]),
-                    Deserialize::deserialize(&serialized).unwrap()
-                );
-            });
-            )*
+            coder_roundtrip!($(x: $ty => x),*);
         };
 
         ($($var:ident: $ty:ty => $expr:expr),*) => {
             $(
             proptest!(|($var: $ty)| {
+                use std::io::{Cursor, Seek, SeekFrom};
                 let x = $expr;
-                let serialized = x.serialize().unwrap();
-                prop_assert_eq!(
-                    (x, &[] as &[u8]),
-                    Deserialize::deserialize(&serialized).unwrap()
-                );
+
+                let mut cursor = Cursor::new(Vec::new());
+                x.serialize(&mut cursor).unwrap();
+                cursor.seek(SeekFrom::Start(0)).unwrap();
+
+                prop_assert_eq!(x, Deserialize::deserialize(&mut cursor).unwrap());
             });
             )*
         };
