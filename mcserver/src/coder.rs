@@ -5,12 +5,16 @@ use std::{
     mem::size_of,
 };
 
+use smallvec::SmallVec;
+
 #[derive(Debug)]
 pub(crate) enum Error {
     InvalidBooleanValue(u8),
     NotEnoughBytesForVarInt,
     IoError(std::io::Error),
 }
+
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -35,8 +39,6 @@ impl From<std::io::Error> for Error {
         Error::IoError(value)
     }
 }
-
-type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub(crate) trait Serialize {
     fn serialize(&self, w: impl Write) -> Result<()>;
@@ -124,16 +126,17 @@ macro_rules! coder_varint_impl {
 
             impl Serialize for $ty {
                 fn serialize(&self, mut w: impl Write) -> Result<()> {
+                    const MAX_BYTE_SIZE: usize = 1 + std::mem::size_of::<$ty>() * 8 / 7;
+
                     if self.0 == 0 {
                         w.write_all(&[0])?;
 
                         return Ok(());
                     }
 
-                    // TODO: Use a SmallVec or just a buffer since the size is known
-                    let mut buf = Vec::new();
+                    let mut buf = SmallVec::<[u8; MAX_BYTE_SIZE]>::new();
 
-                    for i in 0..=std::mem::size_of::<$ty>() * 8 / 7 {
+                    for i in 0..MAX_BYTE_SIZE {
                         let rest = self.0 >> (7 * i);
                         if rest == 0 {
                             break;
