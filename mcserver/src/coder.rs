@@ -1,12 +1,28 @@
 use std::{borrow::Cow, convert::TryInto};
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum SerializeError {
+pub(crate) enum Error {
     InvalidBooleanValue(u8),
     NotEnoughBytesForVarInt,
 }
 
-type Result<T, E = SerializeError> = std::result::Result<T, E>;
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Error::InvalidBooleanValue(n) => write!(
+                f,
+                "Invalid value for boolean: expected 0x00 or 0x01, found {:#x}",
+                n
+            ),
+
+            Error::NotEnoughBytesForVarInt => write!(f, "Not enough bytes for VarInt"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+type Result<T, E = Error> = std::result::Result<T, E>;
 type WithRemaining<'a, T> = (T, &'a [u8]);
 
 pub(crate) trait Serialize {
@@ -33,7 +49,7 @@ impl Deserialize for bool {
             match buf[0] {
                 0 => false,
                 1 => true,
-                n => Err(SerializeError::InvalidBooleanValue(n))?,
+                n => Err(Error::InvalidBooleanValue(n))?,
             },
             &buf[1..],
         ))
@@ -129,7 +145,7 @@ macro_rules! coder_varint_impl {
                                 byte & 0b10_00_00_00 == 0
                             },
 
-                            None => Err(SerializeError::NotEnoughBytesForVarInt)?,
+                            None => Err(Error::NotEnoughBytesForVarInt)?,
                         };
 
                         buf = &buf[1..];
