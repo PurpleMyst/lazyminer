@@ -18,6 +18,12 @@ pub(crate) enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+macro_rules! lsb {
+    ($n:expr) => {
+        (1 << $n) - 1
+    };
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         use Error::*;
@@ -150,7 +156,7 @@ macro_rules! coder_varint_impl {
                             break;
                         }
 
-                        let lower = (rest & 0b01_11_11_11) as u8;
+                        let lower = (rest & lsb!(7)) as u8;
                         buf.push(lower | 0b10_00_00_00);
                     }
 
@@ -215,55 +221,116 @@ impl Deserialize for String {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Debug)]
+pub struct Position {
+    x: i32, // 26 bits
+    y: i16, // 12 bits
+    z: i32, // 26 bits
+}
+
+impl Serialize for Position {
+    fn serialize(&self, w: impl Write) -> Result<()> {
+        let x: u64 = self.x as u64 & lsb!(26);
+        let y: u64 = self.y as u64 & lsb!(12);
+        let z: u64 = self.z as u64 & lsb!(26);
+
+        let n: u64 = (x << (26 + 12)) | (y << 26) | z;
+
+        n.serialize(w)
+    }
+}
+
+impl Deserialize for Position {
+    fn deserialize(r: impl Read) -> Result<Self> {
+        let n = u64::deserialize(r)?;
+
+        let z = (n & lsb!(26)) as u32;
+        let y = ((n >> 26) & lsb!(12)) as u16;
+        let x = ((n >> (26 + 12)) & lsb!(26)) as u32;
+
+        macro_rules! uN_to_iN {
+            ($x:ident: $N:literal; $from_ty:ty => $to_ty:ty) => {
+                $x as $to_ty
+                    - if $x >= (2 as $from_ty).pow($N - 1) {
+                        (2 as $to_ty).pow($N)
+                    } else {
+                        0
+                    }
+            };
+        };
+
+        let x = uN_to_iN!(x: 26; u32 => i32);
+        let y = uN_to_iN!(y: 12; u16 => i16);
+        let z = uN_to_iN!(z: 26; u32 => i32);
+
+        Ok(Self { x, y, z })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
 
     macro_rules! coder_roundtrip {
+        ($expr:block$(: $expr_ty:ty)?) => {{
+            use std::io::{Cursor, Seek, SeekFrom};
+            let x = $expr;
+
+            let mut cursor = Cursor::new(Vec::new());
+            x.serialize(&mut cursor).unwrap();
+            cursor.seek(SeekFrom::Start(0)).unwrap();
+
+            let deserialized$(: $expr_ty)? = Deserialize::deserialize(&mut cursor).unwrap();
+            prop_assert_eq!(x, deserialized);
+        }};
+    }
+
+    macro_rules! coder_roundtrip_proptest {
         ($($ty:ty),*) => {
-            coder_roundtrip!($(x: $ty => { x }: $ty),*);
+            coder_roundtrip_proptest!($(x: $ty => { x }: $ty),*);
         };
 
         ($($var:ident: $ty:ty => $expr:block$(: $expr_ty:ty)?),*) => {
-            $(
-            proptest!(|($var: $ty)| {
-                use std::io::{Cursor, Seek, SeekFrom};
-                let x = $expr;
-
-                let mut cursor = Cursor::new(Vec::new());
-                x.serialize(&mut cursor).unwrap();
-                cursor.seek(SeekFrom::Start(0)).unwrap();
-
-                let deserialized$(: $expr_ty)? = Deserialize::deserialize(&mut cursor).unwrap();
-                assert_eq!(x, deserialized);
-            });
-            )*
+            $( proptest!(|($var: $ty)| coder_roundtrip!($expr$(: $expr_ty)?)); )*
         };
     }
 
     #[test]
     fn test_bool() {
-        coder_roundtrip!(bool);
+        coder_roundtrip_proptest!(bool);
     }
 
     #[test]
     fn test_ints() {
-        coder_roundtrip!(i8, u8, i16, u16, i32, i64);
+        coder_roundtrip_proptest!(i8, u8, i16, u16, i32, i64);
     }
 
     #[test]
     fn test_floats() {
-        coder_roundtrip!(f32, f64);
+        coder_roundtrip_proptest!(f32, f64);
     }
 
     #[test]
     fn test_varint() {
-        coder_roundtrip!(n: i32 => { VarInt(n) }, n: i64 => { VarLong(n) });
+        coder_roundtrip_proptest!(n: i32 => { VarInt(n) }, n: i64 => { VarLong(n) });
     }
 
     #[test]
     fn test_string() {
-        coder_roundtrip!(String);
+        coder_roundtrip_proptest!(String);
+    }
+
+    macro_rules! signed_int_range {
+        ($bits:literal) => {
+            -(1 << ($bits - 1))..(1 << ($bits - 1)) - 1
+        };
+    }
+
+    proptest! {
+        #[test]
+        fn test_position(x in signed_int_range!(26), y in signed_int_range!(12), z in signed_int_range!(26)) {
+            coder_roundtrip!({ Position { x, y: y as _, z } });
+        }
     }
 }
