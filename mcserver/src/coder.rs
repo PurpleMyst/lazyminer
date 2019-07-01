@@ -108,7 +108,7 @@ macro_rules! coder_int_impl {
     };
 }
 
-coder_int_impl!(i8, u8, i16, u16, i32, i64);
+coder_int_impl!(i8, u8, i16, u16, i32, i64, u128);
 
 macro_rules! coder_float_impl {
     ($($ty:ty => $bit_ty:ty),*) => {
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_ints() {
-        coder_roundtrip_proptest!(i8, u8, i16, u16, i32, i64);
+        coder_roundtrip_proptest!(i8, u8, i16, u16, i32, i64, u32, u64, u128);
     }
 
     #[test]
