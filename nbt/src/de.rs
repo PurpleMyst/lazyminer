@@ -1,105 +1,137 @@
-use std::{convert::TryFrom, io::Read};
+use std::{collections::VecDeque, convert::TryFrom, io::Read};
 
 use serde::de::{self, Visitor};
 use serde::forward_to_deserialize_any;
 
 use crate::error::{Error, Result};
 
-pub struct Deserializer<R: Read>(R);
+#[derive(Eq, Clone, Copy, PartialEq, Debug)]
+enum DeserializerState {
+    /// The deserializer is parsing a TAG_List and knows how many elements it has left and of what
+    /// type they are.
+    TagList { size: usize, type_id: u8 },
 
-impl<R: Read> Deserializer<R> {
-    pub fn new(r: R) -> Self {
-        Self(r)
-    }
+    /// The deserializer is parsing a TAG_Compound and is positioned before the next entry.
+    TagCompoundBeforeEntry,
+
+    /// The deserializer is parsing a TAG_Compound and is positioned after the current entry's
+    /// TypeID but before its name.
+    TagCompoundBeforeName { type_id: u8 },
+
+    /// The deserializer is parsing a TAG_Compound and is positioned after the current entry's
+    /// TypeID and Name.
+    TagCompoundBeforeValue { type_id: u8 },
+}
+
+pub struct Deserializer<R: Read> {
+    r: R,
+    state: VecDeque<DeserializerState>,
 }
 
 impl<R: Read> Deserializer<R> {
+    pub fn new(r: R) -> Self {
+        Self {
+            r,
+            state: VecDeque::default(),
+        }
+    }
+}
+macro_rules! de_int {
+    ($self:ident; $ty:ty) => {{
+        let mut buf = [0; std::mem::size_of::<$ty>()];
+        $self.r.read_exact(&mut buf)?;
+        <$ty>::from_be_bytes(buf)
+    }};
+}
+
+macro_rules! de_float {
+    ($self:ident; $bits_ty:ty => $ty:ty) => {
+        <$ty>::from_bits(de_int!($self; $bits_ty))
+    };
+}
+
+macro_rules! de_size {
+    ($self:ident; $ty:ty | $expected:expr) => {{
+        let size_signed = de_int!($self; $ty);
+        let size: Result<usize> = usize::try_from(size_signed).map_err(|_| {
+            de::Error::invalid_type(de::Unexpected::Signed(size_signed as i64), &$expected)
+        });
+
+        size?
+    }};
+}
+
+impl<R: Read> Deserializer<R> {
+    fn parse_string(&mut self) -> Result<String> {
+        let size = de_size!(self; i16 | "the size of a string");
+        let mut buf = vec![0; size];
+        self.r.read_exact(&mut buf)?;
+
+        cesu8::from_java_cesu8(&buf)
+            .map(|s| s.into_owned())
+            .map_err(|_| de::Error::invalid_value(de::Unexpected::Bytes(&buf), &"a string"))
+    }
+
+    fn parse_type_id(&mut self) -> Result<u8> {
+        let mut type_id_buf = [0u8; 1];
+        self.r.read_exact(&mut type_id_buf)?;
+        Ok(type_id_buf[0])
+    }
+
     fn parse_tag_payload<'de, V: Visitor<'de>>(
-        &'de mut self,
+        &mut self,
         visitor: V,
         type_id: u8,
     ) -> Result<V::Value> {
-        macro_rules! de_int {
-            ($ty:ty) => {{
-                let mut buf = [0; std::mem::size_of::<$ty>()];
-                self.0.read_exact(&mut buf)?;
-                <$ty>::from_be_bytes(buf)
-            }};
-        }
-
-        macro_rules! de_float {
-            ($bits_ty:ty => $ty:ty) => {
-                <$ty>::from_bits(de_int!($bits_ty))
-            };
-        }
-
-        macro_rules! de_size {
-            ($ty:ty) => {{
-                let size_signed = de_int!($ty);
-                let size: Result<usize> = usize::try_from(size_signed).map_err(|_| {
-                    de::Error::invalid_type(de::Unexpected::Signed(size_signed as i64), &visitor)
-                });
-
-                size?
-            }};
-        }
-
         match type_id {
             // TAG_Byte
-            1 => visitor.visit_i8(de_int!(i8)),
+            1 => visitor.visit_i8(de_int!(self; i8)),
 
             // TAG_Short
-            2 => visitor.visit_i16(de_int!(i16)),
+            2 => visitor.visit_i16(de_int!(self; i16)),
 
             // TAG_Int
-            3 => visitor.visit_i32(de_int!(i32)),
+            3 => visitor.visit_i32(de_int!(self; i32)),
 
             // TAG_Long
-            4 => visitor.visit_i64(de_int!(i64)),
+            4 => visitor.visit_i64(de_int!(self; i64)),
 
             // TAG_Float
-            5 => visitor.visit_f32(de_float!(u32 => f32)),
+            5 => visitor.visit_f32(de_float!(self; u32 => f32)),
 
             // TAG_Double
-            6 => visitor.visit_f64(de_float!(u64 => f64)),
+            6 => visitor.visit_f64(de_float!(self; u64 => f64)),
 
             // TAG_Byte_Array
             // This is technically an array of signed bytes, but just using `visit_bytes`
             // should be fine.
             7 => {
-                let size = de_size!(i32);
+                let size = de_size!(self; i32 | visitor);
                 let mut buf = vec![0; size];
-                self.0.read_exact(&mut buf)?;
+                self.r.read_exact(&mut buf)?;
                 visitor.visit_bytes(&buf)
             }
 
             // TAG_String
-            8 => {
-                use std::borrow::Cow;
+            8 => visitor.visit_string(self.parse_string()?),
 
-                let size = de_size!(i16);
-                let mut buf = vec![0; size];
-                self.0.read_exact(&mut buf)?;
-                let s: Result<Cow<str>> = cesu8::from_java_cesu8(&buf)
-                    .map_err(|_| de::Error::invalid_value(de::Unexpected::Bytes(&buf), &visitor));
+            // TAG_List
+            9 => {
+                let type_id = self.parse_type_id()?;
 
-                visitor.visit_str(&s?)
+                let size = de_size!(self; i32 | visitor);
+
+                self.state
+                    .push_back(DeserializerState::TagList { size, type_id });
+
+                visitor.visit_seq(&mut *self)
             }
 
-            9 => {
-                let type_id = {
-                    let mut type_id_buf = [0u8; 1];
-                    self.0.read_exact(&mut type_id_buf)?;
-                    type_id_buf[0]
-                };
-
-                let size = de_size!(i32);
-
-                visitor.visit_seq(ListTag {
-                    de: &mut *self,
-                    type_id,
-                    size,
-                })
+            // TAG_Compound
+            10 => {
+                self.state
+                    .push_back(DeserializerState::TagCompoundBeforeEntry);
+                visitor.visit_map(&mut *self)
             }
 
             _ => Err(de::Error::invalid_type(
@@ -110,18 +142,47 @@ impl<R: Read> Deserializer<R> {
     }
 }
 
-impl<'de, 'a: 'de, R: Read> de::Deserializer<'de> for &'a mut Deserializer<R> {
+impl<'de, R: Read> de::Deserializer<'de> for &'_ mut Deserializer<R> {
     type Error = Error;
 
     // Look at the input data to decide what Serde data model type to
     // deserialize as. Not all data formats are able to support this operation.
     // Formats that support `deserialize_any` are known as self-describing.
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        let type_id = {
-            let mut type_id_buf = [0u8; 1];
-            self.0.read_exact(&mut type_id_buf)?;
-            type_id_buf[0]
+        dbg!(&self.state);
+
+        let type_id = match self.state.pop_back() {
+            None => self.parse_type_id()?,
+
+            Some(DeserializerState::TagCompoundBeforeEntry) => unreachable!(),
+
+            Some(DeserializerState::TagCompoundBeforeName { type_id }) => {
+                self.state
+                    .push_back(DeserializerState::TagCompoundBeforeValue { type_id });
+                return visitor.visit_string(self.parse_string()?);
+            }
+
+            Some(state @ DeserializerState::TagList { .. }) => {
+                self.state.push_back(state);
+
+                if let DeserializerState::TagList { type_id, .. } = state {
+                    type_id
+                } else {
+                    unreachable!()
+                }
+            }
+
+            Some(DeserializerState::TagCompoundBeforeValue { type_id }) => {
+                self.state
+                    .push_back(DeserializerState::TagCompoundBeforeEntry);
+                type_id
+            }
         };
+
+        if self.state.is_empty() {
+            // throw away name
+            self.parse_string()?;
+        }
 
         match type_id {
             _ => self.parse_tag_payload(visitor, type_id),
@@ -135,41 +196,60 @@ impl<'de, 'a: 'de, R: Read> de::Deserializer<'de> for &'a mut Deserializer<R> {
     }
 }
 
-struct ListTag<'a, R: Read> {
-    de: &'a mut Deserializer<R>,
-    size: usize,
-    type_id: u8,
-}
-
-impl<'de, R: Read> de::Deserializer<'de> for ListTag<'de, R> {
-    type Error = Error;
-
-    // Look at the input data to decide what Serde data model type to
-    // deserialize as. Not all data formats are able to support this operation.
-    // Formats that support `deserialize_any` are known as self-describing.
-    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        self.de.parse_tag_payload(visitor, self.type_id)
-    }
-
-    forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf option unit unit_struct newtype_struct seq tuple
-        tuple_struct map struct enum identifier ignored_any
-    }
-}
-
-impl<'de, 'a: 'de, R: Read> de::SeqAccess<'de> for ListTag<'de, R> {
+impl<'de, R: Read> de::SeqAccess<'de> for Deserializer<R> {
     type Error = Error;
 
     fn next_element_seed<T: de::DeserializeSeed<'de>>(
         &mut self,
         seed: T,
     ) -> Result<Option<T::Value>, Self::Error> {
-        if self.size == 0 {
-            return Ok(None);
-        }
+        if let Some(DeserializerState::TagList { size, type_id }) = self.state.pop_back() {
+            if size == 0 {
+                return Ok(None);
+            }
 
-        self.size -= 1;
-        seed.deserialize(&mut *self).map(Some)
+            self.state.push_back(DeserializerState::TagList {
+                size: size - 1,
+                type_id,
+            });
+
+            seed.deserialize(self).map(Some)
+        } else {
+            Err(de::Error::custom("Invalid state in SeqAccess"))
+        }
+    }
+}
+
+impl<'de, R: Read> de::MapAccess<'de> for Deserializer<R> {
+    type Error = Error;
+
+    fn next_key_seed<K: de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, Self::Error> {
+        if let Some(DeserializerState::TagCompoundBeforeEntry) = self.state.pop_back() {
+            let type_id = self.parse_type_id()?;
+
+            if type_id == 0 {
+                return Ok(None);
+            }
+
+            self.state
+                .push_back(DeserializerState::TagCompoundBeforeName { type_id });
+            seed.deserialize(self).map(Some)
+        } else {
+            Err(de::Error::custom("Invalid state in next_key_seed"))
+        }
+    }
+
+    fn next_value_seed<V: de::DeserializeSeed<'de>>(
+        &mut self,
+        seed: V,
+    ) -> Result<V::Value, Self::Error> {
+        if let Some(DeserializerState::TagCompoundBeforeValue { .. }) = self.state.back() {
+            seed.deserialize(self)
+        } else {
+            Err(de::Error::custom("Invalid state in next_value_seed"))
+        }
     }
 }
