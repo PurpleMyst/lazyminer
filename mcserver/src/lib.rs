@@ -1,4 +1,10 @@
-mod coder;
-mod packet;
+#![feature(never_type)]
 
-pub use packet::Packet;
+macro_rules! lsb {
+    ($n:expr) => {
+        (1 << $n) - 1
+    };
+}
+
+mod coder;
+mod objs;
