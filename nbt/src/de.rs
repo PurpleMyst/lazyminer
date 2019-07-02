@@ -37,33 +37,58 @@ impl<R: Read> Deserializer<R> {
     }
 }
 macro_rules! de_int {
-    ($self:ident; $ty:ty) => {{
-        let mut buf = [0; std::mem::size_of::<$ty>()];
-        $self.r.read_exact(&mut buf)?;
-        <$ty>::from_be_bytes(buf)
-    }};
-}
-
-macro_rules! de_float {
-    ($self:ident; $bits_ty:ty => $ty:ty) => {
-        <$ty>::from_bits(de_int!($self; $bits_ty))
+    ($($meth:ident: $ty:ty),*) => {
+        $(
+        fn $meth(&mut self) -> Result<$ty> {
+            let mut buf = [0; std::mem::size_of::<$ty>()];
+            self.r.read_exact(&mut buf)?;
+            Ok(<$ty>::from_be_bytes(buf))
+        }
+        )*
     };
 }
 
-macro_rules! de_size {
-    ($self:ident; $ty:ty | $expected:expr) => {{
-        let size_signed = de_int!($self; $ty);
-        let size: Result<usize> = usize::try_from(size_signed).map_err(|_| {
-            de::Error::invalid_type(de::Unexpected::Signed(size_signed as i64), &$expected)
-        });
-
-        size?
-    }};
+macro_rules! de_float {
+    ($($meth:ident: $parse_bits:ident => $ty:ty),*) => {
+        $(
+        fn $meth(&mut self) -> Result<$ty> {
+            self.$parse_bits().map(<$ty>::from_bits)
+        }
+        )*
+    };
 }
 
 impl<R: Read> Deserializer<R> {
+    de_int!(
+        parse_i8: i8,
+        parse_i16: i16,
+        parse_i32: i32,
+        parse_i64: i64,
+        parse_u32: u32,
+        parse_u64: u64
+    );
+
+    de_float!(
+        parse_f32: parse_u32 => f32,
+        parse_f64: parse_u64 => f64
+    );
+
+    fn parse_usize<T>(&mut self, value: T, expected: &dyn de::Expected) -> Result<usize>
+    where
+        usize: TryFrom<T>,
+        i64: From<T>,
+        T: Copy,
+    {
+        usize::try_from(value).map_err(|_| {
+            de::Error::invalid_type(de::Unexpected::Signed(i64::from(value)), expected)
+        })
+    }
+
     fn parse_string(&mut self) -> Result<String> {
-        let size = de_size!(self; i16 | "the size of a string");
+        let size = {
+            let size_i16 = self.parse_i16()?;
+            self.parse_usize(size_i16, &"the size of a string")?
+        };
         let mut buf = vec![0; size];
         self.r.read_exact(&mut buf)?;
 
@@ -85,28 +110,32 @@ impl<R: Read> Deserializer<R> {
     ) -> Result<V::Value> {
         match type_id {
             // TAG_Byte
-            1 => visitor.visit_i8(de_int!(self; i8)),
+            1 => visitor.visit_i8(self.parse_i8()?),
 
             // TAG_Short
-            2 => visitor.visit_i16(de_int!(self; i16)),
+            2 => visitor.visit_i16(self.parse_i16()?),
 
             // TAG_Int
-            3 => visitor.visit_i32(de_int!(self; i32)),
+            3 => visitor.visit_i32(self.parse_i32()?),
 
             // TAG_Long
-            4 => visitor.visit_i64(de_int!(self; i64)),
+            4 => visitor.visit_i64(self.parse_i64()?),
 
             // TAG_Float
-            5 => visitor.visit_f32(de_float!(self; u32 => f32)),
+            5 => visitor.visit_f32(self.parse_f32()?),
 
             // TAG_Double
-            6 => visitor.visit_f64(de_float!(self; u64 => f64)),
+            6 => visitor.visit_f64(self.parse_f64()?),
 
             // TAG_Byte_Array
             // This is technically an array of signed bytes, but just using `visit_bytes`
             // should be fine.
             7 => {
-                let size = de_size!(self; i32 | visitor);
+                let size = {
+                    let size_i32 = self.parse_i32()?;
+                    self.parse_usize(size_i32, &visitor)?
+                };
+
                 let mut buf = vec![0; size];
                 self.r.read_exact(&mut buf)?;
                 visitor.visit_bytes(&buf)
@@ -118,8 +147,10 @@ impl<R: Read> Deserializer<R> {
             // TAG_List
             9 => {
                 let type_id = self.parse_type_id()?;
-
-                let size = de_size!(self; i32 | visitor);
+                let size = {
+                    let size_i32 = self.parse_i32()?;
+                    self.parse_usize(size_i32, &visitor)?
+                };
 
                 self.state
                     .push_back(DeserializerState::TagList { size, type_id });
@@ -145,12 +176,7 @@ impl<R: Read> Deserializer<R> {
 impl<'de, R: Read> de::Deserializer<'de> for &'_ mut Deserializer<R> {
     type Error = Error;
 
-    // Look at the input data to decide what Serde data model type to
-    // deserialize as. Not all data formats are able to support this operation.
-    // Formats that support `deserialize_any` are known as self-describing.
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        dbg!(&self.state);
-
         let type_id = match self.state.pop_back() {
             None => self.parse_type_id()?,
 
