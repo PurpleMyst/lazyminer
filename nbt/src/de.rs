@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, convert::TryFrom, io::Read};
+use std::{borrow::Cow, collections::VecDeque, convert::TryFrom, io::Read};
 
 use serde::de::{self, Visitor};
 use serde::forward_to_deserialize_any;
@@ -9,18 +9,18 @@ use crate::error::{Error, Result};
 enum DeserializerState {
     /// The deserializer is parsing a TAG_List and knows how many elements it has left and of what
     /// type they are.
-    TagList { size: usize, type_id: u8 },
+    ListBeforeItem { size: usize, type_id: u8 },
 
     /// The deserializer is parsing a TAG_Compound and is positioned before the next entry.
-    TagCompoundBeforeEntry,
+    CompoundBeforeEntry,
 
     /// The deserializer is parsing a TAG_Compound and is positioned after the current entry's
     /// TypeID but before its name.
-    TagCompoundBeforeName { type_id: u8 },
+    CompoundBeforeEntryName { type_id: u8 },
 
     /// The deserializer is parsing a TAG_Compound and is positioned after the current entry's
     /// TypeID and Name.
-    TagCompoundBeforeValue { type_id: u8 },
+    CompoundBeforeEntryPayload { type_id: u8 },
 }
 
 pub struct Deserializer<R: Read> {
@@ -93,7 +93,7 @@ impl<R: Read> Deserializer<R> {
         self.r.read_exact(&mut buf)?;
 
         cesu8::from_java_cesu8(&buf)
-            .map(|s| s.into_owned())
+            .map(Cow::into_owned)
             .map_err(|_| de::Error::invalid_value(de::Unexpected::Bytes(&buf), &"a string"))
     }
 
@@ -153,20 +153,19 @@ impl<R: Read> Deserializer<R> {
                 };
 
                 self.state
-                    .push_back(DeserializerState::TagList { size, type_id });
+                    .push_back(DeserializerState::ListBeforeItem { size, type_id });
 
                 visitor.visit_seq(&mut *self)
             }
 
             // TAG_Compound
             10 => {
-                self.state
-                    .push_back(DeserializerState::TagCompoundBeforeEntry);
+                self.state.push_back(DeserializerState::CompoundBeforeEntry);
                 visitor.visit_map(&mut *self)
             }
 
             _ => Err(de::Error::invalid_type(
-                de::Unexpected::Unsigned(type_id as u64),
+                de::Unexpected::Unsigned(u64::from(type_id)),
                 &visitor,
             )),
         }
@@ -180,27 +179,26 @@ impl<'de, R: Read> de::Deserializer<'de> for &'_ mut Deserializer<R> {
         let type_id = match self.state.pop_back() {
             None => self.parse_type_id()?,
 
-            Some(DeserializerState::TagCompoundBeforeEntry) => unreachable!(),
+            Some(DeserializerState::CompoundBeforeEntry) => unreachable!(),
 
-            Some(DeserializerState::TagCompoundBeforeName { type_id }) => {
+            Some(DeserializerState::CompoundBeforeEntryName { type_id }) => {
                 self.state
-                    .push_back(DeserializerState::TagCompoundBeforeValue { type_id });
+                    .push_back(DeserializerState::CompoundBeforeEntryPayload { type_id });
                 return visitor.visit_string(self.parse_string()?);
             }
 
-            Some(state @ DeserializerState::TagList { .. }) => {
+            Some(state @ DeserializerState::ListBeforeItem { .. }) => {
                 self.state.push_back(state);
 
-                if let DeserializerState::TagList { type_id, .. } = state {
+                if let DeserializerState::ListBeforeItem { type_id, .. } = state {
                     type_id
                 } else {
                     unreachable!()
                 }
             }
 
-            Some(DeserializerState::TagCompoundBeforeValue { type_id }) => {
-                self.state
-                    .push_back(DeserializerState::TagCompoundBeforeEntry);
+            Some(DeserializerState::CompoundBeforeEntryPayload { type_id }) => {
+                self.state.push_back(DeserializerState::CompoundBeforeEntry);
                 type_id
             }
         };
@@ -229,12 +227,12 @@ impl<'de, R: Read> de::SeqAccess<'de> for Deserializer<R> {
         &mut self,
         seed: T,
     ) -> Result<Option<T::Value>, Self::Error> {
-        if let Some(DeserializerState::TagList { size, type_id }) = self.state.pop_back() {
+        if let Some(DeserializerState::ListBeforeItem { size, type_id }) = self.state.pop_back() {
             if size == 0 {
                 return Ok(None);
             }
 
-            self.state.push_back(DeserializerState::TagList {
+            self.state.push_back(DeserializerState::ListBeforeItem {
                 size: size - 1,
                 type_id,
             });
@@ -253,15 +251,17 @@ impl<'de, R: Read> de::MapAccess<'de> for Deserializer<R> {
         &mut self,
         seed: K,
     ) -> Result<Option<K::Value>, Self::Error> {
-        if let Some(DeserializerState::TagCompoundBeforeEntry) = self.state.pop_back() {
+        if let Some(DeserializerState::CompoundBeforeEntry) = self.state.pop_back() {
             let type_id = self.parse_type_id()?;
 
+            // TAG_End
             if type_id == 0 {
                 return Ok(None);
             }
 
             self.state
-                .push_back(DeserializerState::TagCompoundBeforeName { type_id });
+                .push_back(DeserializerState::CompoundBeforeEntryName { type_id });
+
             seed.deserialize(self).map(Some)
         } else {
             Err(de::Error::custom("Invalid state in next_key_seed"))
@@ -272,7 +272,7 @@ impl<'de, R: Read> de::MapAccess<'de> for Deserializer<R> {
         &mut self,
         seed: V,
     ) -> Result<V::Value, Self::Error> {
-        if let Some(DeserializerState::TagCompoundBeforeValue { .. }) = self.state.back() {
+        if let Some(DeserializerState::CompoundBeforeEntryPayload { .. }) = self.state.back() {
             seed.deserialize(self)
         } else {
             Err(de::Error::custom("Invalid state in next_value_seed"))
