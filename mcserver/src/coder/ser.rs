@@ -35,102 +35,17 @@ macro_rules! ser_float {
     }
 }
 
-pub enum NoSerialize {}
-
-impl serde::ser::SerializeMap for NoSerialize {
-    type Ok = ();
-    type Error = Error;
-
-    fn serialize_key<T: ?Sized>(&mut self, _key: &T) -> Result<()> {
-        unreachable!()
-    }
-
-    fn serialize_value<T: ?Sized>(&mut self, _value: &T) -> Result<()> {
-        unreachable!()
-    }
-
-    fn end(self) -> Result<()> {
-        unreachable!()
-    }
-}
-
-impl serde::ser::SerializeTuple for NoSerialize {
-    type Ok = ();
-    type Error = Error;
-
-    fn serialize_element<T: ?Sized>(&mut self, _element: &T) -> Result<()> {
-        unreachable!()
-    }
-
-    fn end(self) -> Result<()> {
-        unreachable!()
-    }
-}
-
-impl serde::ser::SerializeTupleStruct for NoSerialize {
-    type Ok = ();
-    type Error = Error;
-
-    fn serialize_field<T: ?Sized>(&mut self, _element: &T) -> Result<()> {
-        unreachable!()
-    }
-
-    fn end(self) -> Result<()> {
-        unreachable!()
-    }
-}
-
-impl serde::ser::SerializeTupleVariant for NoSerialize {
-    type Ok = ();
-    type Error = Error;
-
-    fn serialize_field<T: ?Sized>(&mut self, _element: &T) -> Result<()> {
-        unreachable!()
-    }
-
-    fn end(self) -> Result<()> {
-        unreachable!()
-    }
-}
-
-impl serde::ser::SerializeStruct for NoSerialize {
-    type Ok = ();
-    type Error = Error;
-
-    fn serialize_field<T: ?Sized>(&mut self, _key: &'static str, _value: &T) -> Result<()> {
-        unreachable!()
-    }
-
-    fn end(self) -> Result<()> {
-        unreachable!()
-    }
-}
-
-impl serde::ser::SerializeStructVariant for NoSerialize {
-    type Ok = ();
-    type Error = Error;
-
-    fn serialize_field<T: ?Sized>(&mut self, _key: &'static str, _value: &T) -> Result<()> {
-        unreachable!()
-    }
-
-    fn end(self) -> Result<()> {
-        unreachable!()
-    }
-}
-
 impl<W: Write> ser::Serializer for &'_ mut Serializer<W> {
     type Ok = ();
-
     type Error = Error;
 
     type SerializeSeq = Self;
-    type SerializeTuple = NoSerialize;
-    type SerializeTupleStruct = NoSerialize;
-    type SerializeTupleVariant = NoSerialize;
-    type SerializeMap = NoSerialize;
-    type SerializeStruct = NoSerialize;
-    type SerializeStructVariant = NoSerialize;
+    type SerializeTuple = ser::Impossible<Self::Ok, Self::Error>;
+    type SerializeTupleStruct = ser::Impossible<Self::Ok, Self::Error>;
+    type SerializeTupleVariant = ser::Impossible<Self::Ok, Self::Error>;
+    type SerializeMap = ser::Impossible<Self::Ok, Self::Error>;
+    type SerializeStruct = ser::Impossible<Self::Ok, Self::Error>;
+    type SerializeStructVariant = ser::Impossible<Self::Ok, Self::Error>;
 
     fn serialize_bool(self, v: bool) -> Result<()> {
         self.0
