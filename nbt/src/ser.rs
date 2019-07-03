@@ -6,10 +6,19 @@ use crate::error::{Error, Result};
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 enum State {
+    /// The serializer is in a TAG_List with a known size and is positioned before the first item,
+    /// so it doesn't know the TypeID of the list.
     FirstListItem { size: i32 },
+
+    /// The serializer is in a TAG_List with a known size and TypeID and is positioned before the
+    /// next item.
     InList { type_id: u8, size: i32 },
 
+    /// The serializer is in a TAG_Compound and is positioned before the next named tag.
     CompoundBeforeEntry,
+
+    /// The serializer is in a TAG_Compound and is positioned before the current named tag's
+    /// payload but after its TypeID and name.
     CompoundBeforeEntryValue { name: String },
 }
 
@@ -97,6 +106,8 @@ impl<W: Write> Serializer<W> {
                 let size = size.clone();
                 self.state.pop_back();
                 self.state.push_back(State::InList {
+                    // We subtract one from the size because we are in the process of serializing
+                    // the first item already.
                     size: size - 1,
                     type_id,
                 });
@@ -109,8 +120,13 @@ impl<W: Write> Serializer<W> {
                 size,
                 type_id: list_type_id,
             }) => {
-                assert_eq!(type_id, *list_type_id, "fuk u");
+                if type_id != *list_type_id {
+                    return Err(Error::Message(String::from(
+                        "Heterogenuous sequence not allowed in NBT format",
+                    )));
+                }
 
+                // The serializer should stop us before we get here.
                 if *size == 0 {
                     unreachable!();
                 }
@@ -123,12 +139,19 @@ impl<W: Write> Serializer<W> {
     }
 
     fn serialize_name(&mut self) -> Result<()> {
+        // We `pop_back` from the state even though we just pop it back in the TAG_List case to
+        // avoid a copy in the TAG_Compound case.
         match self.state.pop_back() {
+            // If we're not in a TAG_List we must assign a name to every tag, but we don't have any
+            // name to assign to tags not inside a TAG_Compound, so we just assign a dummy empty
+            // name.
             None => self.serialize_string_payload(""),
+
             Some(state @ State::InList { .. }) | Some(state @ State::FirstListItem { .. }) => {
                 self.state.push_back(state);
                 Ok(())
             }
+
             Some(State::CompoundBeforeEntry) => unreachable!(),
             Some(State::CompoundBeforeEntryValue { name }) => {
                 self.serialize_string_payload(&name)?;
@@ -338,8 +361,11 @@ impl<W: Write> ser::SerializeTuple for &'_ mut Serializer<W> {
             }
 
             Some(State::FirstListItem { size }) if *size == 0 => {
-                // nothing was actually serialized so we have to do it ourselves here
-                let size = size.clone();
+                // If we get to the end without switching to the `InList` state, it means we have
+                // not serialized a single element, because this list is empty, and so we haven't serialized any TypeID nor
+                // size. Since by the spec we must serialize a TypeID even for the empty list, we
+                // utilize the TAG_End TypeID because it feels right.
+                let size = *size;
                 self.w.write_all(&[0])?;
                 self.serialize_i32_payload(size)?;
 
