@@ -84,6 +84,7 @@ impl<R: Read> Deserializer<R> {
         })
     }
 
+    // FIXME: Avoid allocation here.
     fn parse_string(&mut self) -> Result<String> {
         let size = {
             let size_i16 = self.parse_i16()?;

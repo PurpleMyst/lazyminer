@@ -4,10 +4,13 @@ use serde::ser;
 
 use crate::error::{Error, Result};
 
-#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 enum State {
     FirstListItem { size: i32 },
     InList { type_id: u8, size: i32 },
+
+    CompoundBeforeEntry,
+    CompoundBeforeEntryValue { name: String },
 }
 
 pub struct Serializer<W: Write> {
@@ -86,7 +89,9 @@ impl<W: Write> Serializer<W> {
 
     fn serialize_type_id(&mut self, type_id: u8) -> Result<()> {
         match self.state.back_mut() {
-            None => self.w.write_all(&[type_id])?,
+            None
+            | Some(State::CompoundBeforeEntryValue { .. })
+            | Some(State::CompoundBeforeEntry) => self.w.write_all(&[type_id])?,
 
             Some(State::FirstListItem { size }) => {
                 let size = size.clone();
@@ -117,12 +122,21 @@ impl<W: Write> Serializer<W> {
         Ok(())
     }
 
-    fn serialize_name(&mut self, name: &str) -> Result<()> {
-        if self.state.is_empty() {
-            self.serialize_string_payload(name)?;
-        }
+    fn serialize_name(&mut self) -> Result<()> {
+        match self.state.pop_back() {
+            None => self.serialize_string_payload(""),
+            Some(state @ State::InList { .. }) | Some(state @ State::FirstListItem { .. }) => {
+                self.state.push_back(state);
+                Ok(())
+            }
+            Some(State::CompoundBeforeEntry) => unreachable!(),
+            Some(State::CompoundBeforeEntryValue { name }) => {
+                self.serialize_string_payload(&name)?;
+                self.state.push_back(State::CompoundBeforeEntry);
 
-        Ok(())
+                Ok(())
+            }
+        }
     }
 }
 
@@ -131,7 +145,7 @@ macro_rules! ser_tag {
         $(
         fn $meth(self, v: $ty) -> Result<()> {
             self.serialize_type_id($type_id)?;
-            self.serialize_name("")?;
+            self.serialize_name()?;
             self.$serialize_payload(v)?;
 
             Ok(())
@@ -158,8 +172,8 @@ impl<W: Write> ser::Serializer for &'_ mut Serializer<W> {
     type SerializeTuple = Self;
     type SerializeTupleStruct = ser::Impossible<Self::Ok, Self::Error>;
     type SerializeTupleVariant = ser::Impossible<Self::Ok, Self::Error>;
-    type SerializeMap = ser::Impossible<Self::Ok, Self::Error>;
-    type SerializeStruct = ser::Impossible<Self::Ok, Self::Error>;
+    type SerializeMap = Self;
+    type SerializeStruct = Self;
     type SerializeStructVariant = ser::Impossible<Self::Ok, Self::Error>;
 
     ser_tag!(
@@ -170,8 +184,22 @@ impl<W: Write> ser::Serializer for &'_ mut Serializer<W> {
         (5, serialize_f32_payload) => serialize_f32: f32,
         (6, serialize_f64_payload) => serialize_f64: f64,
         (7, serialize_bytearray_payload) => serialize_bytes: &[u8],
-        (8, serialize_string_payload) => serialize_str: &str,
     );
+
+    fn serialize_str(self, v: &str) -> Result<()> {
+        if let Some(State::CompoundBeforeEntry) = self.state.back() {
+            self.state.pop_back();
+            self.state
+                .push_back(State::CompoundBeforeEntryValue { name: v.to_owned() });
+            return Ok(());
+        }
+
+        self.serialize_type_id(8)?;
+        self.serialize_name()?;
+        self.serialize_string_payload(v)?;
+
+        Ok(())
+    }
 
     fn serialize_none(self) -> Result<()> {
         Ok(())
@@ -225,7 +253,7 @@ impl<W: Write> ser::Serializer for &'_ mut Serializer<W> {
 
     fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple> {
         self.serialize_type_id(9)?;
-        self.serialize_name("")?;
+        self.serialize_name()?;
         self.state.push_back(State::FirstListItem {
             size: i32::try_from(len).map_err(|_| Error::Message(String::from("tuple too long")))?,
         });
@@ -251,7 +279,10 @@ impl<W: Write> ser::Serializer for &'_ mut Serializer<W> {
     }
 
     fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap> {
-        unimplemented!();
+        self.serialize_type_id(10)?;
+        self.serialize_name()?; // XXX: remove this to text context
+        self.state.push_back(State::CompoundBeforeEntry);
+        Ok(self)
     }
 
     fn serialize_struct(self, _name: &'static str, len: usize) -> Result<Self::SerializeStruct> {
@@ -319,5 +350,44 @@ impl<W: Write> ser::SerializeTuple for &'_ mut Serializer<W> {
         }
 
         Ok(())
+    }
+}
+
+impl<W: Write> ser::SerializeMap for &'_ mut Serializer<W> {
+    type Ok = ();
+    type Error = Error;
+
+    fn serialize_key<T: ?Sized + ser::Serialize>(&mut self, key: &T) -> Result<()> {
+        key.serialize(&mut **self)
+    }
+
+    fn serialize_value<T: ?Sized + ser::Serialize>(&mut self, value: &T) -> Result<()> {
+        value.serialize(&mut **self)
+    }
+
+    fn end(self) -> Result<()> {
+        self.serialize_type_id(0)?;
+        assert_eq!(self.state.pop_back(), Some(State::CompoundBeforeEntry));
+        Ok(())
+    }
+}
+
+impl<W: Write> ser::SerializeStruct for &'_ mut Serializer<W> {
+    type Ok = ();
+    type Error = Error;
+
+    fn serialize_field<T: ?Sized + ser::Serialize>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<()> {
+        ser::SerializeMap::serialize_key(self, key)?;
+        ser::SerializeMap::serialize_value(self, value)?;
+
+        Ok(())
+    }
+
+    fn end(self) -> Result<()> {
+        ser::SerializeMap::end(self)
     }
 }

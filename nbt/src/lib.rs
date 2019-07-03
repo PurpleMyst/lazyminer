@@ -37,6 +37,7 @@ mod tests {
         }
     }
 
+    // NOTE: NBT vectors must be homogenouos.
     macro_rules! vecs {
         ($(Value::$variant:ident($ty:ty),)*) => {
             prop_oneof![
@@ -71,6 +72,18 @@ mod tests {
         ]
     }
 
+    fn hashmap_of_value_strategy() -> impl Strategy<Value = Value> {
+        prop_oneof![primitive_value_strategy(), vec_of_value_strategy()].prop_recursive(
+            4,  // depth
+            16, // desired size
+            16, // expected branch size
+            |element| {
+                prop::collection::btree_map(any::<String>().prop_map(Value::String), element, 0..16)
+                    .prop_map(Value::Map)
+            },
+        )
+    }
+
     proptest! {
         #[test]
         fn test_primitives(v in primitive_value_strategy()) {
@@ -81,12 +94,55 @@ mod tests {
         fn test_vecs(v in vec_of_value_strategy()) {
             roundtrip!(v);
         }
+
+        #[test]
+        fn test_compound(d in hashmap_of_value_strategy()) {
+            roundtrip!(d);
+        }
     }
 
     #[test]
     fn test_empty_vec() -> Result<(), TestCaseError> {
         let empty: Vec<()> = Vec::new();
         roundtrip!(empty; Vec<()>);
+        Ok(())
+    }
+
+    #[test]
+    fn test_vec_of_btreemap() -> Result<(), TestCaseError> {
+        use std::collections::BTreeMap;
+
+        let v: Vec<BTreeMap<String, i8>> = vec![
+            [(String::from("a"), 2), (String::from("b"), 2)]
+                .into_iter()
+                .cloned()
+                .collect(),
+            [(String::from("d"), 3), (String::from("g"), 7)]
+                .into_iter()
+                .cloned()
+                .collect(),
+        ];
+        roundtrip!(v; Vec<BTreeMap<String, i8>>);
+        Ok(())
+    }
+
+    #[test]
+    fn test_struct() -> Result<(), TestCaseError> {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(PartialEq, Serialize, Deserialize, Debug)]
+        struct Item {
+            name: String,
+            price: f64,
+        }
+
+        let item = Item {
+            name: "cake".to_owned(),
+            price: 2.5,
+        };
+
+        roundtrip!(item);
+
         Ok(())
     }
 }

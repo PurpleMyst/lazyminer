@@ -5,12 +5,8 @@ authors = ["Purple Myst <PurpleMyst@users.noreply.github.com>"]
 edition = "2018"
 
 [dependencies]
-serde = { version = "1.0.94", features = [ "unstable" ] }
+serde = { version = "1.0.94", features = [ "unstable", "derive" ] }
 cesu8 = "1.1.0"
-
-# for binary
-serde-transcode = "1.1.0"
-serde_json = "1.0.40"
 
 [dev-dependencies]
 proptest = "0.9.4"
