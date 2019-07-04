@@ -103,7 +103,7 @@ impl<W: Write> Serializer<W> {
             | Some(State::CompoundBeforeEntry) => self.w.write_all(&[type_id])?,
 
             Some(State::FirstListItem { size }) => {
-                let size = size.clone();
+                let size = *size;
                 self.state.pop_back();
                 self.state.push_back(State::InList {
                     // We subtract one from the size because we are in the process of serializing

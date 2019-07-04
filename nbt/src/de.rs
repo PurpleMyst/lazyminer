@@ -84,8 +84,8 @@ impl<R: Read> Deserializer<R> {
         })
     }
 
-    // FIXME: Avoid allocation here.
-    fn parse_string(&mut self) -> Result<String> {
+    // We take a closure in this method to avoid having to allocate a String object to return
+    fn parse_string<T>(&mut self, f: impl FnOnce(&str) -> T) -> Result<T> {
         let size = {
             let size_i16 = self.parse_i16()?;
             self.parse_usize(size_i16, &"the size of a string")?
@@ -93,9 +93,10 @@ impl<R: Read> Deserializer<R> {
         let mut buf = vec![0; size];
         self.r.read_exact(&mut buf)?;
 
-        cesu8::from_java_cesu8(&buf)
-            .map(Cow::into_owned)
-            .map_err(|_| de::Error::invalid_value(de::Unexpected::Bytes(&buf), &"a string"))
+        let s: Result<Cow<str>> = cesu8::from_java_cesu8(&buf)
+            .map_err(|_| de::Error::invalid_value(de::Unexpected::Bytes(&buf), &"a string"));
+
+        Ok(f(&s?))
     }
 
     fn parse_type_id(&mut self) -> Result<u8> {
@@ -143,7 +144,7 @@ impl<R: Read> Deserializer<R> {
             }
 
             // TAG_String
-            8 => visitor.visit_string(self.parse_string()?),
+            8 => self.parse_string(|s| visitor.visit_str(s))?,
 
             // TAG_List
             9 => {
@@ -185,7 +186,8 @@ impl<'de, R: Read> de::Deserializer<'de> for &'_ mut Deserializer<R> {
             Some(DeserializerState::CompoundBeforeEntryName { type_id }) => {
                 self.state
                     .push_back(DeserializerState::CompoundBeforeEntryPayload { type_id });
-                return visitor.visit_string(self.parse_string()?);
+
+                return self.parse_string(|s| visitor.visit_str(s))?;
             }
 
             Some(state @ DeserializerState::ListBeforeItem { .. }) => {
@@ -206,7 +208,7 @@ impl<'de, R: Read> de::Deserializer<'de> for &'_ mut Deserializer<R> {
 
         if self.state.is_empty() {
             // throw away name
-            self.parse_string()?;
+            self.parse_string(|_| ())?;
         }
 
         match type_id {
